@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+#
+# Copyright (C) 2016, Christopher A. Snapp <snappca@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+# enable unbound variable checking
+set -u
+
+prog='bulksync'
+version=16.02
+pid=$$
+
+input_dir=
+output_dir=
+concurrency=1
+continue=false
+debug=false
+log_dir="$HOME/${prog}.$(date +%Y-%m-%d_%H%M%S)"
+start_time="$(date '+%Y-%m-%d %H:%M:%S')"
+
+# dependency check
+[[ "$(which lockfile-create 2>/dev/null)" ]] || { echo 'ERROR: lockfile-progs not found'; exit 1; }
+[[ "$(which rsync 2>/dev/null)" ]] || { echo 'ERROR: rsync not found'; exit 1; }
+[[ $(id -u) = 0 ]] || { echo "ERROR: ${prog} must be run by the root user"; exit 1; }
+
+trap 'echo "SYNC ($pid) interrupted at $(date \"+%Y-%m-%d %H:%M:%S\")" >&2 | tee -a "${log_dir}/TIMES"; jobs -p | xargs kill -9 2>/dev/null; exit;' INT TERM
+
+# print command usage
+print_usage () {
+    cat <<EOF
+Usage: $prog [-dhv] [--help] [-c count] [-i input-directory] [-l log-directory] [-o output-directory]
+
+Options:
+    -c count
+        the number of jobs to run concurrently; default is 10 if no value is
+        provided
+
+    -d  enable debug mode (print ALL output)
+
+    -h, --help  display this help and exit
+
+    -i input directory
+        the directory to sync FROM
+
+    -l log directory
+        the directory where sync state and log output will be tracked
+
+    -o output directory
+        the directory to sync TO
+
+    -v  display version information and exit
+EOF
+}
+
+# print error message followed by usage and exit
+error () {
+    echo -e "\nERROR: $1\n" >&2
+    print_usage >&2
+    exit 1
+}
+
+# process arguments
+for arg in $@; do
+    case "$arg" in
+        -c)
+            concurrency='-c'
+            ;;
+        -c[0-9]*)
+            concurrency=${arg#-c}
+            ;;
+        -d)
+            debug=true
+            ;;
+        -h | --help)
+            print_usage
+            exit 0
+            ;;
+        -i)
+            input_dir='-i'
+            ;;
+        -l)
+            log_dir='-l'
+            ;;
+        -o)
+            output_dir='-o'
+            ;;
+        -v)
+            echo $prog $version
+            exit 0
+            ;;
+         *)
+            if [[ "$concurrency" == '-c' ]] && [[ "$arg" =~ ^[0-9]+$ ]]; then
+                concurrency=$arg
+            elif [[ "$input_dir" == '-i' ]]; then
+                input_dir="$arg"
+            elif [[ "$log_dir" == '-l' ]]; then
+                log_dir="$arg"
+            elif [[ "$output_dir" == '-o' ]]; then
+                output_dir="$arg"
+            fi
+            ;;
+    esac
+done
+
+# set default concurrecy if number was not provided
+[[ "$concurrency" == '-c' ]] && concurrency=10
+
+state_file="${log_dir}/SYNC_STATE"
+
+# sanity checks
+[[ -d "$input_dir" ]] || error 'an existing input directory must be provided'
+[[ -d "$output_dir" ]] || error 'an existing output directory must be provided'
+[[ -r "$state_file" && $(grep -c '^\-' "$state_file") -eq 0 ]] && { echo "No remaining entries found in $state_file" >&2; exit 0; }
+
+# prompt user to continue
+{
+    if [[ -r "$state_file" ]]; then
+        total=$(grep -v '^#' "$state_file" | wc -l)
+        remaining=$(grep -c '^\-' "$state_file")
+    else
+        total=$(ls -1 $input_dir | wc -l)
+        remaining=$total
+    fi
+
+    echo -e "\n\tSync FROM: $input_dir" >&2
+    echo -e "\n\tSync TO: $output_dir" >&2
+
+    if [[ $concurrency -gt 1 ]]; then
+        echo -e "\n\tMethod: up to $concurrency concurrently" >&2
+    else
+        echo -e "\n\tMethod: incremental" >&2
+    fi
+
+    echo -e "\n\tTotal Entries Tracked: ${total}" >&2
+
+    echo -e "\n\tRemaining Entries: ${remaining}" >&2
+
+    echo -e "\n\tTracking File:\n\t\t$state_file" >&2
+
+    if [[ -n "$log_dir" ]]; then
+        echo -e "\n\tLog Directory:\n\t\t${log_dir}/logs" >&2
+    fi
+}
+
+if ! $continue; then
+    echo -e -n "\nAre you sure you want to continue [y/N]? "
+    read continue
+
+    if [[ ! "$continue" =~ y|Y ]]; then
+        echo 'Aborted!'
+        exit 0
+    fi
+fi
+
+mkdir -p "${log_dir}/logs"
+
+# generate state file if one doesn't already exist
+[[ -r "$state_file" ]] || ls -1 "$input_dir" | sed 's|^|-    size?    |;s|/$||;' > "$state_file"
+
+echo "SYNC ($pid) started at $start_time" >&2 | tee -a "${log_dir}/TIMES"
+
+running=0
+count=1
+total=$(wc -l "$state_file" | awk '{print $1}')
+
+while [[ $(grep -c '^\-' "$state_file") -gt 0 ]]; do
+    output="$(printf '%d-%06d' ${pid} ${count})"
+
+    lockfile-create "$state_file"
+    entry="$(grep -m1 '^\-' "$state_file" | awk '{print $3}')"
+    remaining=$(grep -c '^\-' "$state_file")
+    sed -i "/ ${entry}$/{s/^-/R/}" "$state_file"
+    lockfile-remove "$state_file"
+
+    if [[ $concurrency -gt 1 ]]; then
+        running=$(jobs -p | wc -l)
+
+        if [[ $running -lt $concurrency ]]; then
+            echo "Spawning $output - $remaining of $total remaining" >&2
+
+            {
+                jobnum=$count
+
+                echo "SYNC ($pid)\n" rsync -Pauh --delete "${input_dir}/${entry}" "${output_dir}/" > "${log_dir}/logs/${output}.running"
+                rsync -Pauh --delete "${input_dir}/${entry}" "${output_dir}/" >> "${log_dir}/logs/${output}.running"
+
+                $debug && echo -e "Finished $output" >&2
+
+                mv "${log_dir}/logs/${output}.running" "${log_dir}/logs/${output}.done"
+
+                lockfile-create "$state_file"
+                sed -i "/ ${entry}$/{s/^R/C/}" "$state_file"
+                lockfile-remove "$state_file"
+            } &
+
+            ((count+=1))
+
+        fi
+    else
+        echo "Spawning $output - $remaining of $total remaining" >&2
+
+        echo -e "SYNC ($pid)\n" rsync -Pauh --delete "${input_dir}/${entry}" "${output_dir}/${entry}\n\n" > "${log_dir}/logs/${output}.running"
+        rsync -Pauh --delete "${input_dir}/${entry}" "${output_dir}/" >> "${log_dir}/logs/${output}.running"
+
+        mv "${log_dir}/logs/${output}.running" "${log_dir}/logs/${output}.done"
+
+        lockfile-create "$state_file"
+        sed -i "/ ${entry}$/{s/^R/C/}" "$state_file"
+        lockfile-remove "$state_file"
+
+        $debug && echo -e "Finished $output" >&2
+
+        ((count+=1))
+    fi
+done
+
+wait
+
+echo "SYNC ($pid) completed at $(date '+%Y-%m-%d %H:%M:%S')" >&2 | tee -a "${log_dir}/TIMES"
+
+exit 0
