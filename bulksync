@@ -187,10 +187,10 @@ while [[ $(grep -c '^\-' "$state_file") -gt 0 ]]; do
         running=$(jobs -p | wc -l)
 
         if [[ $running -lt $concurrency ]]; then
+            sed -i "/ ${entry}$/{s/^-/R/}" "$state_file"
             echo "Spawning $output - $remaining of $total remaining" >&2
 
             {
-                sed -i "/ ${entry}$/{s/^-/R/}" "$state_file"
                 jobnum=$count
 
                 echo "SYNC ($pid)\n" rsync -Pauh --delete "${input_dir}/${entry}" "${output_dir}/" > "${log_dir}/logs/${output}.running"
