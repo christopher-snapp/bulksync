@@ -181,13 +181,13 @@ while [[ $(grep -c '^\-' "$state_file") -gt 0 ]]; do
     lockfile-create "$state_file"
     entry="$(grep -m1 '^\-' "$state_file" | awk '{print $3}')"
     remaining=$(grep -c '^\-' "$state_file")
-    sed -i "/ ${entry}$/{s/^-/R/}" "$state_file"
     lockfile-remove "$state_file"
 
     if [[ $concurrency -gt 1 ]]; then
         running=$(jobs -p | wc -l)
 
         if [[ $running -lt $concurrency ]]; then
+            sed -i "/ ${entry}$/{s/^-/R/}" "$state_file"
             echo "Spawning $output - $remaining of $total remaining" >&2
 
             {
@@ -209,6 +209,7 @@ while [[ $(grep -c '^\-' "$state_file") -gt 0 ]]; do
 
         fi
     else
+        sed -i "/ ${entry}$/{s/^-/R/}" "$state_file"
         echo "Spawning $output - $remaining of $total remaining" >&2
 
         echo -e "SYNC ($pid)\n" rsync -Pauh --delete "${input_dir}/${entry}" "${output_dir}/${entry}\n\n" > "${log_dir}/logs/${output}.running"
